@@ -18,7 +18,7 @@ from traceotter.attributes import (
 )
 from traceotter.client import TraceotterClient, get_client, now_ns
 from traceotter.models import OTelEvent, OTelSpanPayload
-from traceotter.serializers import (
+from traceotter._utils.serializer import (
     parse_model_from_response,
     parse_model_name_from_metadata,
     parse_model_parameters,

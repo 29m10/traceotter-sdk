@@ -7,104 +7,125 @@ import time
 from queue import Empty, Queue
 from typing import Any
 
+from traceotter._utils.ingest_schema import SchemaValidationError, validate_span_schema
+from traceotter._utils.request import (
+    APIError,
+    APIErrors,
+    TraceotterHttpIngestClient,
+    grpc_target_from_base_url,
+    order_spans_parents_first,
+)
 from traceotter.models import OTelEvent, OTelSpanPayload
-from traceotter.serializers import safe_json_dumps
+from traceotter._utils.serializer import safe_json_dumps
 
 
 def now_ns() -> int:
     return time.time_ns()
 
 
-def _order_spans_parents_first(spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if not spans:
-        return []
+def _to_raw_span(span: dict[str, Any]) -> dict[str, Any]:
+    trace_id = str(span.get("trace_id") or "")
+    span_id = str(span.get("span_id") or "")
+    parent_span_id = span.get("parent_span_id")
 
-    id_to_span: dict[str, dict[str, Any]] = {}
-    for span in spans:
-        span_id = span.get("span_id")
-        if isinstance(span_id, str) and span_id and span_id not in id_to_span:
-            id_to_span[span_id] = span
+    attributes = dict(span.get("attributes") or {})
+    attributes.setdefault("otel_span_name", span.get("name"))
+    attributes.setdefault("otel_status_code", span.get("status_code"))
+    attributes.setdefault("otel_status_description", span.get("status_message"))
+    if parent_span_id is not None:
+        attributes.setdefault("parent_span_id", str(parent_span_id))
 
-    ids = set(id_to_span.keys())
-    if not ids:
-        return spans
-
-    children: dict[str, list[str]] = {}
-    in_degree: dict[str, int] = {span_id: 0 for span_id in ids}
-    for span_id, span in id_to_span.items():
-        parent_id = span.get("parent_span_id")
-        if isinstance(parent_id, str) and parent_id in ids and parent_id != span_id:
-            children.setdefault(parent_id, []).append(span_id)
-            in_degree[span_id] += 1
-
-    queue = [span_id for span_id in ids if in_degree[span_id] == 0]
-    order: list[str] = []
-    while queue:
-        node = queue.pop(0)
-        order.append(node)
-        for child in children.get(node, []):
-            in_degree[child] -= 1
-            if in_degree[child] == 0:
-                queue.append(child)
-
-    for span_id in ids:
-        if span_id not in order:
-            order.append(span_id)
-
-    ordered = [id_to_span[span_id] for span_id in order]
-    seen = {id(span) for span in ordered}
-    tail = [span for span in spans if id(span) not in seen]
-    return ordered + tail
-
-
-def _to_ingest_envelopes(spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if not spans:
-        return []
-
-    envelope: dict[str, Any] = {"spans": []}
-    for span in spans:
-        trace_id = str(span.get("trace_id") or "")
-        span_id = str(span.get("span_id") or "")
-        parent_span_id = span.get("parent_span_id")
-
-        attributes = dict(span.get("attributes") or {})
-        attributes.setdefault("otel_span_name", span.get("name"))
-        attributes.setdefault("otel_status_code", span.get("status_code"))
-        attributes.setdefault("otel_status_description", span.get("status_message"))
-        if parent_span_id is not None:
-            attributes.setdefault("parent_span_id", str(parent_span_id))
-
-        context: dict[str, Any] = {}
-        if trace_id:
-            context["trace_id"] = trace_id
-        if span_id:
-            context["span_id"] = span_id
-        if parent_span_id is not None:
-            context["parent_span_id"] = str(parent_span_id)
-
-        details: dict[str, Any] = {
-            "trace_id": trace_id or None,
-            "id": span_id or None,
-            "start_time": (
-                float(span["start_time_unix_nano"]) / 1_000_000_000.0
-                if span.get("start_time_unix_nano") is not None
-                else None
-            ),
-            "attributes": attributes,
-            "context": context,
-            "span_id": span_id or None,
-        }
-
-        envelope["spans"].append({"details": details})
-
-    return [envelope] if envelope["spans"] else []
+    return {
+        "trace_id": trace_id or None,
+        "id": span_id or None,
+        "span_id": span_id or None,
+        "start_time": (
+            float(span["start_time_unix_nano"]) / 1_000_000_000.0
+            if span.get("start_time_unix_nano") is not None
+            else None
+        ),
+        "attributes": attributes,
+        "context": {},
+    }
 
 
 class ConsoleExporter:
     """Placeholder exporter for local development."""
 
     def export(self, envelopes: list[dict[str, Any]]) -> None:
-        _ = envelopes
+        print(safe_json_dumps(envelopes))
+
+
+class HttpIngestExporter:
+    def __init__(
+        self,
+        *,
+        public_key: str,
+        secret_key: str,
+        host: str,
+        timeout_seconds: int = 5,
+        version: str = "0.1.0",
+        max_retries: int = 3,
+        grpc_target: str | None = None,
+    ) -> None:
+        self._client = TraceotterHttpIngestClient(
+            public_key=public_key,
+            secret_key=secret_key,
+            base_url=host,
+            version=version,
+            timeout_seconds=timeout_seconds,
+            grpc_target=grpc_target,
+        )
+        self._max_retries = max_retries
+
+    def close(self) -> None:
+        self._client.close()
+
+    def export(self, envelopes: list[dict[str, Any]]) -> None:
+        raw_spans = self._extract_raw_spans(envelopes)
+        validated = []
+        for raw in raw_spans:
+            try:
+                validated.append(validate_span_schema(raw))
+            except SchemaValidationError:
+                continue
+        if not validated:
+            return
+        ordered = order_spans_parents_first(validated)
+        self._send_with_retry(ordered)
+
+    @staticmethod
+    def _extract_raw_spans(envelopes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        spans: list[dict[str, Any]] = []
+        for envelope in envelopes:
+            items = envelope.get("spans") if isinstance(envelope, dict) else None
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if isinstance(item, dict) and isinstance(item.get("details"), dict):
+                    spans.append(item["details"])
+        return spans
+
+    def _send_with_retry(self, spans: list[dict[str, Any]]) -> None:
+        attempt = 0
+        delay = 0.5
+        while True:
+            try:
+                self._client.batch_post(spans)
+                return
+            except APIErrors:
+                raise
+            except APIError as err:
+                status = int(err.status) if str(err.status).isdigit() else 0
+                retryable = status == 429 or status >= 500 or status == 0
+                if attempt >= self._max_retries or not retryable:
+                    raise
+            except Exception:  # noqa: BLE001
+                if attempt >= self._max_retries:
+                    raise
+            attempt += 1
+            time.sleep(delay)
+            delay = min(delay * 2, 5.0)
 
 
 class TraceotterClient:
@@ -138,7 +159,7 @@ class TraceotterClient:
             else:
                 resolved_flush_interval_seconds = 5.0
 
-        self._exporter = exporter or ConsoleExporter()
+        self._exporter = exporter or _default_exporter()
         self._batch_size = max(1, int(resolved_batch_size))
         self._flush_interval_seconds = max(0.1, float(resolved_flush_interval_seconds))
 
@@ -174,8 +195,8 @@ class TraceotterClient:
 
         for batch in remaining_batches:
             if batch:
-                ordered = _order_spans_parents_first(batch)
-                self._exporter.export(_to_ingest_envelopes(ordered))
+                raw_spans = [_to_raw_span(span) for span in batch]
+                self._exporter.export([{"spans": [{"details": span} for span in raw_spans]}])
 
     def shutdown(self) -> None:
         if self._stop_event.is_set():
@@ -183,6 +204,9 @@ class TraceotterClient:
         self._stop_event.set()
         self._thread.join(timeout=2)
         self.flush()
+        close = getattr(self._exporter, "close", None)
+        if callable(close):
+            close()
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():
@@ -232,8 +256,8 @@ class TraceotterClient:
             self._last_flush_monotonic = now
 
         if batch:
-            ordered = _order_spans_parents_first(batch)
-            self._exporter.export(_to_ingest_envelopes(ordered))
+            raw_spans = [_to_raw_span(span) for span in batch]
+            self._exporter.export([{"spans": [{"details": span} for span in raw_spans]}])
 
     @staticmethod
     def _encode(payload: OTelSpanPayload) -> dict[str, Any]:
@@ -262,6 +286,25 @@ class TraceotterClient:
 
 _CLIENT_SINGLETON: TraceotterClient | None = None
 _CLIENT_SINGLETON_LOCK = threading.Lock()
+
+
+def _default_exporter() -> Any:
+    public_key = os.environ.get("TRACEOTTER_PUBLIC_KEY")
+    secret_key = os.environ.get("TRACEOTTER_SECRET_KEY")
+    host = os.environ.get("TRACEOTTER_HOST", "https://api.traceotter.com")
+    timeout = int(os.environ.get("TRACEOTTER_TIMEOUT", "5"))
+    use_grpc = os.environ.get("TRACEOTTER_USE_GRPC", "").lower() in ("1", "true", "yes")
+    grpc_port = int(os.environ.get("TRACEOTTER_GRPC_PORT", "50051"))
+    grpc_target = grpc_target_from_base_url(host, grpc_port) if use_grpc else None
+    if public_key and secret_key:
+        return HttpIngestExporter(
+            public_key=public_key,
+            secret_key=secret_key,
+            host=host,
+            timeout_seconds=timeout,
+            grpc_target=grpc_target,
+        )
+    return ConsoleExporter()
 
 
 def get_client(
