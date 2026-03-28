@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import logging
 import os
 import threading
 import time
@@ -17,6 +18,8 @@ from traceotter._utils.request import (
 )
 from traceotter.models import OTelEvent, OTelSpanPayload
 from traceotter._utils.serializer import safe_json_dumps
+
+log = logging.getLogger("traceotter")
 
 
 def now_ns() -> int:
@@ -112,16 +115,19 @@ class HttpIngestExporter:
             try:
                 self._client.batch_post(spans)
                 return
-            except APIErrors:
-                raise
+            except APIErrors as err:
+                log.debug("Ingest batch rejected: %s", err)
+                return
             except APIError as err:
                 status = int(err.status) if str(err.status).isdigit() else 0
                 retryable = status == 429 or status >= 500 or status == 0
                 if attempt >= self._max_retries or not retryable:
-                    raise
+                    log.debug("Ingest failed: %s", err)
+                    return
             except Exception:  # noqa: BLE001
                 if attempt >= self._max_retries:
-                    raise
+                    log.debug("Ingest failed after retries", exc_info=True)
+                    return
             attempt += 1
             time.sleep(delay)
             delay = min(delay * 2, 5.0)
