@@ -59,6 +59,7 @@ htmlcov/
 # IDE / editors
 .vscode/
 .idea/
+.cursor/
 *.swp
 *.swo
 
